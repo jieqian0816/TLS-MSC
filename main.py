@@ -1,498 +1,382 @@
-import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["LOKY_MAX_CPU_COUNT"] = "4"
-import numpy as np
-import scipy.io as sio
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler
-from sklearn import metrics
+"""Paper-aligned training, validation-only selection, and held-out testing.
+
+Default: IP, ten seeds, paper budgets, gamma=1.0 (a configurable starting value).
+Use --gamma-values to select ONE gamma per dataset from mean validation accuracy
+across runs. No test score is computed until this selection is complete.
+"""
+import argparse
+import csv
+from datetime import datetime
+import hashlib
+import json
+from pathlib import Path
+import platform
+import random
 import time
-from sklearn import preprocessing
+
+import numpy as np
+import scipy
+from scipy.io import loadmat
+import sklearn
+from sklearn.preprocessing import StandardScaler
+import skimage
 import torch
-import slic
+from torch.nn import functional as F
+
 import model
-from thop import profile
-import os
-from visual import Draw_Classification_Map,applyPCA,get_Samples_GT,GT_To_One_Hot
-import copy
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-samples_type = ['ratio', 'same_num'][1] 
-
-for (FLAG, curr_train_ratio, Scale, dim, top_k) in [(1,30,60,50,5)]:
-# 模型配置IP(1,30,60,50,5), PU(2,30,300,50,5), Sa(3,30,300,50,5), Hou(4,30,600,40,5)
-    torch.cuda.empty_cache()
-    OA_ALL = []
-    AA_ALL = []
-    KPP_ALL = []
-    AVG_ALL = []
-    F1_ALL =[]
-    RECALL_ALL = []
-    Train_Time_ALL=[]
-    Test_Time_ALL=[]
-
-    Seed_List=[1,3,5,7,9]
-    # Seed_List=[41,42,43,44,45,46,47,48,49,50]
-
-    # 数据集读取
-    if FLAG == 1:  # IP数据集
-        data_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Indian_pines\Indian_pines_corrected.mat')
-        data = data_mat['indian_pines_corrected']
-        gt_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Indian_pines\Indian_pines_gt.mat')
-        gt = gt_mat['indian_pines_gt']
-
-        val_ratio = 0.05  
-        class_count = 16  
-        learning_rate = 0.0005
-        max_epoch = 200
-        dataset_name = "indian_"
-        pass
-
-    if FLAG == 2:  # PU数据集
-        data_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\PaviaU\PaviaU.mat')
-        data = data_mat['paviaU']
-        gt_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\PaviaU\PaviaU_gt.mat')
-        gt = gt_mat['paviaU_gt']
-        
-        val_ratio = 0.005  
-        class_count = 9  
-        learning_rate = 5e-4  
-        max_epoch = 100  
-        dataset_name = "paviaU_"
-        pass
-
-    if FLAG == 3:  # Salinas数据集
-        data_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Salinas\Salinas_corrected.mat')
-        data = data_mat['salinas_corrected']
-        gt_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Salinas\Salinas_gt.mat')
-        gt = gt_mat['salinas_gt']
-
-        val_ratio = 0.005
-        class_count = 16
-        learning_rate = 5e-4
-        max_epoch = 100
-        dataset_name = "salinas_"
-        pass
-
-    if FLAG == 4:  # Houston数据集
-        data_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Houston\houston_corrected.mat')
-        data = data_mat['houston']
-        gt_mat = sio.loadmat(r'C:\Download\Pycharm\Project\TLS-MSC\datasets\Houston\houston_gt.mat')
-        train_gt = gt_mat['houston_gt_tr']
-        test_gt = gt_mat['houston_gt_te']
-        # 合并训练和测试标签矩阵
-        merged_gt = test_gt.copy()
-        merged_gt[train_gt != 0] = train_gt[train_gt != 0]  # 用 train_gt 的非零值覆盖 test_gt
-        gt = merged_gt
-
-        val_ratio = 0.005
-        class_count = 15
-        learning_rate = 5e-4
-        max_epoch = 150
-        dataset_name = "houston_"
-        pass
-
-    if samples_type == 'same_num': val_ratio = 6 
-    superpixel_scale = Scale
-    train_ratio = curr_train_ratio
-    height, width, bands = data.shape
-
-    # 数据标准化
-    orig_data=data
-    data = np.reshape(data, [height * width, bands])
-    minMax = preprocessing.StandardScaler()  # 对每列数据进行标准化：(x - mean) / std
-    data = minMax.fit_transform(data)  # 目的：消除不同波段之间的量纲差异，使数据更适合机器学习模型的训练
-    data = np.reshape(data, [height, width, bands])
-
-    gt_reshape=np.reshape(gt, [-1])
-    samplesCount_list = []  # 用于存储每个类别的样本数量
-    for i in range(class_count):
-        idx = np.where(gt_reshape == i + 1)[-1]  # 是一个一维数组，包含当前类别所有样本的索引
-        samplesCount = len(idx)  # 统计当前类别的样本数量
-        samplesCount_list.append(samplesCount)
-    print('输出每个类别的样本数量', samplesCount_list)
-
-    # 创建目录保存结果
-    model_dir = './results/' + dataset_name + "/"
-    if not os.path.isdir(model_dir):
-         os.makedirs(model_dir, exist_ok=True)
-    
-    Draw_Classification_Map(label=gt, name=model_dir+dataset_name+'gt') # ground truth
-
-    for exp, curr_seed in enumerate(Seed_List):
-        print("==============================================================================================")
-        print("========================================第", exp+1, "轮实验============================================")
-        print("==============================================================================================")
-        train_samples_gt, test_samples_gt, val_samples_gt= get_Samples_GT(curr_seed, gt, class_count, curr_train_ratio,val_ratio, samples_type)
-        train_samples_gt_onehot = GT_To_One_Hot(train_samples_gt, class_count)
-        test_samples_gt_onehot = GT_To_One_Hot(test_samples_gt, class_count)
-        val_samples_gt_onehot = GT_To_One_Hot(val_samples_gt, class_count)
-        train_samples_gt_onehot = np.reshape(train_samples_gt_onehot, [-1, class_count]).astype(int)
-        test_samples_gt_onehot = np.reshape(test_samples_gt_onehot, [-1, class_count]).astype(int)
-        val_samples_gt_onehot = np.reshape(val_samples_gt_onehot, [-1, class_count]).astype(int)
-        Test_GT = np.reshape(test_samples_gt, [height, width])
-        train_val_test_gt=[train_samples_gt,val_samples_gt,test_samples_gt]
-        train_label_mask = np.zeros([height * width, class_count])
-        temp_ones = np.ones([class_count])
-        train_gt_HW = train_samples_gt
-        train_samples_gt = np.reshape(train_samples_gt, [height * width])
-        for i in range(height * width):
-            if train_samples_gt[i] != 0:
-                train_label_mask[i] = temp_ones
-
-        train_label_mask = np.reshape(train_label_mask, [height* width, class_count])
-        test_label_mask = np.zeros([height * width, class_count])
-        temp_ones = np.ones([class_count])
-        test_samples_gt = np.reshape(test_samples_gt, [height * width])
-        for i in range(height * width):
-            if test_samples_gt[i] != 0:
-                test_label_mask[i] = temp_ones
-
-        test_label_mask = np.reshape(test_label_mask, [height* width, class_count])
-        val_label_mask = np.zeros([height * width, class_count])
-        temp_ones = np.ones([class_count])
-        val_samples_gt = np.reshape(val_samples_gt, [height * width])
-        for i in range(height * width):
-            if val_samples_gt[i] != 0:
-                val_label_mask[i] = temp_ones
-
-        val_label_mask = np.reshape(val_label_mask, [height* width, class_count])
-
-        # SLIC超像素分割
-        ls = slic.LDA_SLIC(data, np.reshape( train_samples_gt,[height,width]), class_count-1)
-        tic0=time.time()
-        Q, S, A, Seg = ls.simple_superpixel_no_LDA(scale=superpixel_scale)
-
-        masks_all = []
-        for node_idx in range(A.shape[0]):
-            mk = np.zeros_like(Seg)
-            mk[Seg == node_idx] = 1  # 标记当前超像素区域
-            masks_all.append(mk)
-        # 可视化超像素分割结果
-        Draw_Classification_Map(label=gt, name=model_dir + dataset_name+'gt_seg', segments=masks_all)
-        toc0 = time.time()
-       
-        Q=torch.from_numpy(Q).to(device)
-        A=torch.from_numpy(A).to(device)
-        Seg = torch.from_numpy(Seg).to(device)
-
-        train_samples_gt=torch.from_numpy(train_samples_gt.astype(np.float32)).to(device)
-        test_samples_gt=torch.from_numpy(test_samples_gt.astype(np.float32)).to(device)
-        val_samples_gt=torch.from_numpy(val_samples_gt.astype(np.float32)).to(device)
-
-        train_samples_gt_onehot = torch.from_numpy(train_samples_gt_onehot.astype(np.float32)).to(device)
-        test_samples_gt_onehot = torch.from_numpy(test_samples_gt_onehot.astype(np.float32)).to(device)
-        val_samples_gt_onehot = torch.from_numpy(val_samples_gt_onehot.astype(np.float32)).to(device)
-
-        train_label_mask = torch.from_numpy(train_label_mask.astype(np.float32)).to(device)
-        test_label_mask = torch.from_numpy(test_label_mask.astype(np.float32)).to(device)
-        val_label_mask = torch.from_numpy(val_label_mask.astype(np.float32)).to(device)
-
-        # 模型输入
-        net_input=np.array(data,np.float32)
-        net_input=torch.from_numpy(net_input.astype(np.float32)).to(device)
-        net = model.TLS_MSC(height, width, bands, dim, class_count, Q, Seg, train_samples_gt, top_k)
-        # 打印参数信息
-        print("parameters", net.parameters(), len(list(net.parameters())))
-        net.to(device)
-        MACs, params = profile(net, inputs=(A, net_input), verbose=False)
-        print('MACs: %0.2f M, params: %0.4f K' % (MACs / 1e6, params / 1e3))
+import slic
+from visual import (get_Samples_GT, assert_disjoint_splits, split_counts,
+                    classification_metrics, Draw_Classification_Map, plot_test_tsne)
 
 
-        def compute_loss(predict: torch.Tensor, reallabel_onehot: torch.Tensor, reallabel_mask: torch.Tensor):
-            real_labels = reallabel_onehot
-            we = -torch.mul(real_labels,torch.log(predict))
-            we = torch.mul(we, reallabel_mask) 
-            pool_cross_entropy = torch.sum(we)
-            return pool_cross_entropy
-        
+PAPER_CONFIG = {
+    'IP': dict(folder='Indian_pines', image='Indian_pines_corrected.mat',
+               image_key='indian_pines_corrected', labels='Indian_pines_gt.mat',
+               label_key='indian_pines_gt', classes=16, dim=50, scale=60, epochs=200),
+    'PU': dict(folder='PaviaU', image='PaviaU.mat', image_key='paviaU',
+               labels='PaviaU_gt.mat', label_key='paviaU_gt', classes=9,
+               dim=50, scale=300, epochs=100),
+    'SA': dict(folder='Salinas', image='Salinas_corrected.mat', image_key='salinas_corrected',
+               labels='Salinas_gt.mat', label_key='salinas_gt', classes=16,
+               dim=50, scale=300, epochs=100),
+    'HU': dict(folder='Houston', image='houston_corrected.mat', image_key='houston',
+               labels='houston_gt.mat', label_key=None, classes=15,
+               dim=40, scale=600, epochs=150),
+}
+DEFAULT_SEEDS = list(range(41, 51))
 
-        zeros = torch.zeros([height * width]).to(device).float()
-        def evaluate_performance(network_output, train_samples_gt, train_samples_gt_onehot, require_AA_KPP=False,
-                                 printFlag=True):
-            if False == require_AA_KPP:
-                with torch.no_grad():
-                    available_label_idx = (train_samples_gt != 0).float()
-                    available_label_count = available_label_idx.sum()
-                    correct_prediction = torch.where(
-                        torch.argmax(network_output, 1) == torch.argmax(train_samples_gt_onehot, 1),
-                        available_label_idx, zeros).sum()
-                    OA = correct_prediction.cpu() / available_label_count
 
-                    return OA
-            else:
-                with torch.no_grad():
-                    # 原始OA计算保持不变
-                    available_label_idx = (train_samples_gt != 0).float()
-                    available_label_count = available_label_idx.sum()
-                    correct_prediction = torch.where(
-                        torch.argmax(network_output, 1) == torch.argmax(train_samples_gt_onehot, 1),
-                        available_label_idx, zeros).sum()
-                    OA = correct_prediction.cpu() / available_label_count
-                    OA = OA.cpu().numpy()
+def write_json(path, obj):
+    def convert(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        raise TypeError(type(value).__name__)
+    Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False,
+                                    default=convert, allow_nan=False), encoding='utf-8')
 
-                    # 转换为numpy数组进行处理
-                    zero_vector = np.zeros([class_count])
-                    output_data = network_output.cpu().numpy()
-                    train_samples_gt = train_samples_gt.cpu().numpy()
-                    train_samples_gt_onehot = train_samples_gt_onehot.cpu().numpy()
-                    output_data = np.reshape(output_data, [height * width, class_count])
-                    idx = np.argmax(output_data, axis=-1)
 
-                    for z in range(output_data.shape[0]):
-                        if ~(zero_vector == output_data[z]).all():
-                            idx[z] += 1
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
-                    # 计算各类别的统计量
-                    count_perclass = np.zeros([class_count])
-                    correct_perclass = np.zeros([class_count])
-                    true_positives = np.zeros([class_count])
-                    false_negatives = np.zeros([class_count])
-                    false_positives = np.zeros([class_count])
 
-                    for x in range(len(train_samples_gt)):
-                        if train_samples_gt[x] != 0:
-                            true_class = int(train_samples_gt[x] - 1)
-                            pred_class = int(idx[x] - 1)
-                            count_perclass[true_class] += 1
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
 
-                            if train_samples_gt[x] == idx[x]:
-                                correct_perclass[true_class] += 1
-                                true_positives[true_class] += 1
-                            else:
-                                false_negatives[true_class] += 1
-                                false_positives[pred_class] += 1
 
-                    # 计算各类别精度
-                    test_AC_list = correct_perclass / count_perclass
-                    test_AA = np.average(test_AC_list)
+def load_scene(data_root, dataset):
+    config = PAPER_CONFIG[dataset]
+    folder = Path(data_root) / config['folder']
+    image_path, label_path = folder / config['image'], folder / config['labels']
+    if not image_path.is_file() or not label_path.is_file():
+        raise FileNotFoundError(f'{dataset}: required data files are {image_path} and {label_path}')
+    image = np.asarray(loadmat(image_path)[config['image_key']], dtype=np.float32)
+    label_data = loadmat(label_path)
+    if dataset == 'HU':
+        # The manuscript deliberately uses a random within-scene repartition of
+        # the union, rather than the official Houston challenge train/test split.
+        if 'houston_gt' in label_data:
+            gt = label_data['houston_gt']
+        else:
+            tr, te = label_data['houston_gt_tr'], label_data['houston_gt_te']
+            if np.any((tr > 0) & (te > 0) & (tr != te)):
+                raise ValueError('Houston source masks contain conflicting overlapping labels')
+            gt = np.where(tr > 0, tr, te)
+    else:
+        gt = label_data[config['label_key']]
+    gt = np.asarray(gt, dtype=np.int64)
+    if image.ndim != 3 or gt.shape != image.shape[:2] or not np.isfinite(image).all():
+        raise ValueError('Image/ground-truth shapes or spectral values are invalid')
+    if not np.array_equal(np.unique(gt[gt > 0]), np.arange(1, config['classes'] + 1)):
+        raise ValueError('Ground truth does not contain the expected contiguous classes')
+    return image, gt
 
-                    # 计算召回率(Recall)和F1分数
-                    recall_perclass = true_positives / (true_positives + false_negatives + 1e-10)
-                    precision_perclass = true_positives / (true_positives + false_positives + 1e-10)
-                    f1_perclass = 2 * (precision_perclass * recall_perclass) / (
-                                precision_perclass + recall_perclass + 1e-10)
 
-                    # 计算宏平均F1和召回率
-                    macro_f1 = np.mean(f1_perclass)
-                    macro_recall = np.mean(recall_perclass)
+def is_better_checkpoint(val_correct, val_loss, best_correct, best_loss):
+    """Accuracy is primary; loss breaks exact accuracy ties. Test data absent."""
+    return val_correct > best_correct or (val_correct == best_correct and val_loss < best_loss)
 
-                    # Kappa系数计算保持不变
-                    test_pre_label_list = []
-                    test_real_label_list = []
-                    output_data = np.reshape(output_data, [height * width, class_count])
-                    idx = np.argmax(output_data, axis=-1)
-                    idx = np.reshape(idx, [height, width])
 
-                    for ii in range(height):
-                        for jj in range(width):
-                            if Test_GT[ii][jj] != 0:
-                                test_pre_label_list.append(idx[ii][jj] + 1)
-                                test_real_label_list.append(Test_GT[ii][jj])
+def select_gamma(validation_results):
+    """One fixed gamma per dataset, selected exclusively from validation logs."""
+    grouped = {}
+    for record in validation_results:
+        grouped.setdefault(record['gamma'], []).append(record)
+    return min(grouped, key=lambda gamma: (
+        -np.mean([r['best_val_oa'] for r in grouped[gamma]]),
+        np.mean([r['best_val_loss'] for r in grouped[gamma]]), gamma))
 
-                    test_pre_label_list = np.array(test_pre_label_list)
-                    test_real_label_list = np.array(test_real_label_list)
-                    kappa = metrics.cohen_kappa_score(test_pre_label_list.astype(np.int16),
-                                                      test_real_label_list.astype(np.int16))
-                    test_kpp = kappa
 
-                    if printFlag:
-                        print("test OA=", OA, "AA=", test_AA, 'kpp=', test_kpp)
-                        print("macro F1=", macro_f1, "macro Recall=", macro_recall)
-                        print('acc per class:')
-                        print(test_AC_list)
-                        print('F1 per class:')
-                        print(f1_perclass)
-                        print('Recall per class:')
-                        print(recall_perclass)
+def create_model(config, Q, segments, train_gt, top_k, device):
+    return model.GCN_in_CNN(*train_gt.shape, config['bands'], config['dim'],
+                            config['classes'], torch.as_tensor(Q, device=device),
+                            torch.as_tensor(segments, dtype=torch.long, device=device),
+                            torch.as_tensor(train_gt, dtype=torch.long, device=device),
+                            top_k=top_k).to(device)
 
-                    # 保存所有指标
-                    OA_ALL.append(OA)
-                    AA_ALL.append(test_AA)
-                    KPP_ALL.append(test_kpp)
-                    AVG_ALL.append(test_AC_list)
-                    F1_ALL.append(macro_f1)
-                    RECALL_ALL.append(macro_recall)
 
-                    # 更新结果文件写入内容
-                    f = open(model_dir + dataset_name + '_results.txt', 'a+')
-                    str_results = '\n===============================' \
-                                  + " learning rate=" + str(learning_rate) \
-                                  + " epochs=" + str(max_epoch) \
-                                  + " train ratio=" + str(train_ratio) \
-                                  + " val ratio=" + str(val_ratio) \
-                                  + " ===============================" \
-                                  + "\nOA=" + str(OA) \
-                                  + "\nAA=" + str(test_AA) \
-                                  + '\nkpp=' + str(test_kpp) \
-                                  + '\nmacro F1=' + str(macro_f1) \
-                                  + '\nmacro Recall=' + str(macro_recall) \
-                                  + '\nacc per class: ' + str(test_AC_list) \
-                                  + '\nF1 per class: ' + str(f1_perclass) \
-                                  + '\nRecall per class: ' + str(recall_perclass) \
-                                  + '\n'
-
-                    f.write(str_results)
-                    f.close()
-                    return OA
-
-        optimizer = torch.optim.Adam(net.parameters(),lr=learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50) # 50个epoch内按余弦曲线调整
-
-        best_loss=99999
-        best_OA=0
-        Stop_Flag=0
+def train_candidate(image_tensor, adjacency, Q, segments, train_gt, val_gt,
+                    config, seed, gamma, top_k, checkpoint_dir, device):
+    """Training and checkpoint selection deliberately have no test_gt argument."""
+    set_seed(seed)  # Identical initialization for gamma candidates of a seed.
+    net = create_model(config, Q, segments, train_gt, top_k, device)
+    train_idx = torch.as_tensor(np.flatnonzero(train_gt.ravel()), device=device)
+    val_idx = torch.as_tensor(np.flatnonzero(val_gt.ravel()), device=device)
+    train_targets = torch.as_tensor(train_gt.ravel()[train_idx.cpu().numpy()] - 1,
+                                     dtype=torch.long, device=device)
+    val_targets = torch.as_tensor(val_gt.ravel()[val_idx.cpu().numpy()] - 1,
+                                   dtype=torch.long, device=device)
+    optimizer = torch.optim.Adam((p for p in net.parameters() if p.requires_grad), lr=5e-4)
+    best_correct, best_loss, best_epoch = -1, float('inf'), 0
+    best_state = None
+    history = []
+    synchronize(device)
+    start = time.perf_counter()
+    for epoch in range(1, config['epochs'] + 1):
         net.train()
-        tic1 = time.perf_counter()
-        
-        for i in range(max_epoch+1):
-            optimizer.zero_grad()
-            output, *_ = net(A, net_input)
-            loss = compute_loss(output,train_samples_gt_onehot,train_label_mask)
-            torch.autograd.set_detect_anomaly(True)  # 在backward前添加
-            loss.backward(retain_graph=False)
-            
-            optimizer.step()  
-            if i%10==0:
-                with torch.no_grad():
-                    net.eval()
-                    output, *_ = net(A, net_input)
-                    trainloss = compute_loss(output, train_samples_gt_onehot, train_label_mask)
-                    trainOA = evaluate_performance(output, train_samples_gt, train_samples_gt_onehot)
-                    valloss = compute_loss(output, val_samples_gt_onehot, val_label_mask)
-                    valOA = evaluate_performance(output, val_samples_gt, val_samples_gt_onehot)
-                    print("{}\ttrain loss={}\t train OA={} val loss={}\t val OA={}".format(str(i + 1), trainloss, trainOA, valloss, valOA))
-
-                    if valloss < best_loss  or valOA>best_OA:
-                        best_loss = valloss
-                        best_OA=valOA
-                        Stop_Flag=0
-                        BestNet = copy.deepcopy(net).to("cpu")
-                        
-                        print('save model...')
-                torch.cuda.empty_cache()
-                net.train()
-        toc1 = time.perf_counter()
-
-        print("\n=========================training done. starting evaluation...================================")
-
-        training_time=toc1 - tic1  
-        Train_Time_ALL.append(training_time)
-        
+        optimizer.zero_grad(set_to_none=True)
+        logits, *_ = net.forward_logits(adjacency, image_tensor)
+        # Eqs. (24)--(25): summed CE, only labeled TRAINING pixels.
+        train_loss = F.cross_entropy(logits[train_idx], train_targets, reduction='sum')
+        if not torch.isfinite(train_loss):
+            raise FloatingPointError(f'Nonfinite training loss at epoch {epoch}')
+        train_loss.backward()
+        optimizer.step()
+        net.eval()
+        with torch.no_grad():
+            logits, *_ = net.forward_logits(adjacency, image_tensor)
+            validation_loss = F.cross_entropy(logits[val_idx], val_targets, reduction='sum').item()
+            validation_correct = int((logits[val_idx].argmax(1) == val_targets).sum().item())
+            training_oa = float((logits[train_idx].argmax(1) == train_targets).float().mean().item())
+        if not np.isfinite(validation_loss):
+            raise FloatingPointError(f'Nonfinite validation loss at epoch {epoch}')
+        validation_oa = validation_correct / len(val_idx)
+        history.append(dict(epoch=epoch, train_loss=train_loss.item(), train_oa=training_oa,
+                            val_loss=validation_loss, val_oa=validation_oa))
+        if is_better_checkpoint(validation_correct, validation_loss, best_correct, best_loss):
+            best_correct, best_loss, best_epoch = validation_correct, validation_loss, epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
+        if epoch == 1 or epoch % 10 == 0 or epoch == config['epochs']:
+            print(f'seed={seed} gamma={gamma:g} epoch={epoch}/{config["epochs"]} '
+                  f'train_OA={training_oa * 100:.2f}% val_OA={validation_oa * 100:.2f}%', flush=True)
+    synchronize(device)
+    elapsed = time.perf_counter() - start
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    with (checkpoint_dir / 'history.csv').open('w', encoding='utf-8', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
+    torch.save(best_state, checkpoint_dir / 'best_state.pt')
+    result = dict(seed=seed, gamma=gamma, best_epoch=best_epoch,
+                  best_val_oa=best_correct / len(val_idx), best_val_loss=best_loss,
+                  training_seconds=elapsed, checkpoint=str(checkpoint_dir / 'best_state.pt'),
+                  parameters=sum(p.numel() for p in net.parameters()),
+                  trainable_parameters=sum(p.numel() for p in net.parameters() if p.requires_grad))
+    write_json(checkpoint_dir / 'validation.json', result)
+    del net, optimizer, best_state, logits, train_loss
+    if device.type == 'cuda':
         torch.cuda.empty_cache()
-        with (torch.no_grad()):
-            
-            net = BestNet.to(device)
-            net.eval()
-            tic2 = time.perf_counter()
-            output, out_feat = net(A, net_input)
-            toc2 = time.perf_counter()
-            testloss = compute_loss(output, test_samples_gt_onehot, test_label_mask)
-            testOA = evaluate_performance(output, test_samples_gt, test_samples_gt_onehot,require_AA_KPP=True,printFlag=False)
-            print("{}\ttest loss={}\t test OA={}".format(str(i + 1), testloss, testOA))
-            classification_map = torch.argmax(output, 1).reshape([height,width]).cpu()+1
+    return result
 
-            Draw_Classification_Map(label=classification_map, name=model_dir + dataset_name + 'background' + str(testOA))
 
-            ignored_labels = [0]
-            mask = np.zeros(gt.shape, dtype='bool')
-            for l in ignored_labels:
-                mask[gt == l] = True
-            classification_map[mask] = 0  # 忽略背景
-            Draw_Classification_Map(label=classification_map, name=model_dir + dataset_name + str(testOA))
+def load_saved_state(path):
+    # weights_only is supported by PyTorch >=1.13; files contain only tensors.
+    return torch.load(path, map_location='cpu', weights_only=True)
 
-            testing_time=toc2 - tic2
-            Test_Time_ALL.append(testing_time)
 
-            ################### t-SNE可视化 ####################
-            labels = test_samples_gt.reshape(-1).cpu().numpy()  # 展平为[H*W]
-            features = out_feat.cpu().numpy()  # 形状: [H*W, C]
-            valid_mask = labels > 0  # 过滤无效标签（如背景类标签为0或-1）
-            features = features[valid_mask]
-            labels = labels[valid_mask]
-            unique_labels, counts = np.unique(labels, return_counts=True)
-            sampled_indices = []
-            for class_id, count in zip(unique_labels, counts):
-                class_indices = np.where(labels == class_id)[0]
-                n_samples = min(500, count)  # 每类最多采样500个点, 分层采样（公平比较）
-                sampled_indices.extend(np.random.choice(class_indices, n_samples, replace=False))
-
-            features_sampled = features[sampled_indices]
-            labels_sampled = labels[sampled_indices]
-            features_scaled = StandardScaler().fit_transform(features_sampled) # 标准化特征
-            tsne = TSNE(
-                n_components=2,
-                perplexity=30,
-                learning_rate=200,
-                random_state=42
-            )
-            features_tsne = tsne.fit_transform(features_scaled)
-            plt.figure(figsize=(12, 10))
-            # 可视化, 为少数类分配更大的点和更鲜艳的颜色（动态调整点大小和颜色）
-            cmap = plt.get_cmap('tab20', len(unique_labels))  # viridis
-            for i, class_id in enumerate(unique_labels):
-                mask = (labels_sampled == class_id)
-                size = 100 if counts[i] < 100 else 50  # 少数类点更大
-                plt.scatter(
-                    features_tsne[mask, 0],
-                    features_tsne[mask, 1],
-                    c=[cmap(i)],
-                    label=f'Class {class_id} (n={counts[i]})',
-                    s=size,
-                    alpha=0.7,
-                    edgecolors='w',
-                    linewidths=0.5
-                )
-            plt.axis('off')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='12', shadow=True, borderpad=1)
-            plt.grid(alpha=0.2)
-            plt.tight_layout()
-            plt.savefig(
-                f"{model_dir}{dataset_name}_T-SNE_{testOA}.png",dpi=300,
-                bbox_inches='tight',
-                transparent=True
-            )
-            plt.close()  # 避免内存泄漏
-
+def evaluate_selected(image_tensor, adjacency, Q, segments, train_gt, test_gt,
+                      config, selected, top_k, run_dir, device, plots):
+    """Called only AFTER checkpoint AND dataset-level gamma have been selected."""
+    net = create_model(config, Q, segments, train_gt, top_k, device)
+    net.load_state_dict(load_saved_state(selected['checkpoint']))
+    net.eval()
+    synchronize(device)
+    start = time.perf_counter()
+    with torch.no_grad():
+        logits, nodes, _, features = net.forward_logits(adjacency, image_tensor)
+    synchronize(device)
+    elapsed = time.perf_counter() - start
+    prediction = logits.argmax(1).cpu().numpy().reshape(test_gt.shape) + 1
+    mask = test_gt > 0
+    metrics = classification_metrics(test_gt[mask], prediction[mask], config['classes'])
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(run_dir / 'predictions.npz', prediction=prediction,
+                        test_indices=np.flatnonzero(mask), true_labels=test_gt[mask],
+                        predicted_labels=prediction[mask], selected_stage2=nodes.cpu().numpy())
+    np.savez_compressed(run_dir / 'test_features.npz', features=features[torch.as_tensor(mask.ravel(), device=device)].cpu().numpy(),
+                        labels=test_gt[mask], flat_indices=np.flatnonzero(mask))
+    result = dict(seed=selected['seed'], gamma=selected['gamma'], best_epoch=selected['best_epoch'],
+                  validation_OA_percent=selected['best_val_oa'] * 100,
+                  training_seconds=selected['training_seconds'], testing_seconds=elapsed,
+                  total_seconds=selected['training_seconds'] + elapsed,
+                  parameters=selected['parameters'], trainable_parameters=selected['trainable_parameters'], **metrics)
+    write_json(run_dir / 'metrics.json', result)
+    if plots:
+        labeled_prediction = prediction.copy()
+        # This is the union of split masks; no unknown reference classes are used.
+        split_file = np.load(run_dir / 'splits.npz')
+        labeled_prediction[(split_file['train_gt'] + split_file['val_gt'] + split_file['test_gt']) == 0] = 0
+        Draw_Classification_Map(labeled_prediction, str(run_dir / 'classification'))
+        plot_test_tsne(features.detach().cpu().numpy(), test_gt,
+                       run_dir / 'test_tsne.png', selected['seed'], metrics['OA'])
+    print(f'FINAL {config["dataset"]} seed={selected["seed"]} OA={metrics["OA"]:.2f}% '
+          f'AA={metrics["AA"]:.2f}% kappa={metrics["Kappa"]:.2f}% F1={metrics["macro_F1"]:.2f}%', flush=True)
+    del net, logits, features
+    if device.type == 'cuda':
         torch.cuda.empty_cache()
-        del net
-
-    OA_ALL = np.array(OA_ALL)
-    AA_ALL = np.array(AA_ALL)
-    KPP_ALL = np.array(KPP_ALL)
-    AVG_ALL = np.array(AVG_ALL)
-    F1_ALL = np.array(F1_ALL)
-    RECALL_ALL = np.array(RECALL_ALL)
-    Train_Time_ALL=np.array(Train_Time_ALL)
-    Test_Time_ALL=np.array(Test_Time_ALL)
+    return result
 
 
-    print("\ntrain_ratio={}".format(curr_train_ratio), "\n=====================================================================================")
-    print('OA=', np.mean(OA_ALL), '+-', np.std(OA_ALL))
-    print('AA=', np.mean(AA_ALL), '+-', np.std(AA_ALL))
-    print('Kpp=', np.mean(KPP_ALL), '+-', np.std(KPP_ALL))
-    print('AVG=', np.mean(AVG_ALL, 0), '+-', np.std(AVG_ALL, 0))
-    print('F1=', np.mean(F1_ALL), '+-', np.std(F1_ALL))
-    print('RECALL=', np.mean(RECALL_ALL), '+-', np.std(RECALL_ALL))
-    print("Average training time:{}".format(np.mean(Train_Time_ALL)))
-    print("Average testing time:{}".format(np.mean(Test_Time_ALL)))
-    
-    # 保存数据信息
-    f = open(model_dir + dataset_name + '_results.txt', 'a+')
-    str_results = '\n***************************************************************' \
-    +"\ntrain_ratio={}".format(curr_train_ratio) \
-    +'\nOA='+ str(np.mean(OA_ALL))+ '+-'+ str(np.std(OA_ALL)) \
-    +'\nAA='+ str(np.mean(AA_ALL))+ '+-'+ str(np.std(AA_ALL)) \
-    +'\nKpp='+ str(np.mean(KPP_ALL))+ '+-'+ str(np.std(KPP_ALL)) \
-    +'\nAVG='+ str(np.mean(AVG_ALL,0))+ '+-'+ str(np.std(AVG_ALL,0)) \
-    +'\nF1='+ str(np.mean(F1_ALL))+ '+-'+ str(np.std(F1_ALL)) \
-    +'\nRECALL='+ str(np.mean(RECALL_ALL))+ '+-'+ str(np.std(RECALL_ALL)) \
-    +"\nAverage training time:{}".format(np.mean(Train_Time_ALL)) \
-    +"\nAverage testing time:{}".format(np.mean(Test_Time_ALL)) 
-    f.write(str_results)
-    f.close()
+def source_hashes():
+    base = Path(__file__).resolve().parent
+    return {name: hashlib.sha256((base / name).read_bytes()).hexdigest()
+            for name in ['main.py', 'model.py', 'slic.py', 'visual.py']}
+
+
+def run_dataset(args, dataset, root_dir, device):
+    config = dict(PAPER_CONFIG[dataset], dataset=dataset)
+    for name in ['epochs', 'dim', 'scale']:
+        override = getattr(args, name)
+        if override is not None:
+            config[name] = override
+    image, gt = load_scene(args.data_root, dataset)
+    config['bands'] = image.shape[-1]
+    standardized = StandardScaler().fit_transform(image.reshape(-1, image.shape[-1])).reshape(image.shape).astype(np.float32)
+    out = Path(root_dir) / dataset
+    out.mkdir(parents=True, exist_ok=True)
+    gamma_values = sorted(set(args.gamma_values if args.gamma_values is not None else [args.gamma]))
+    if any(not np.isfinite(gamma) or gamma <= 0 for gamma in gamma_values):
+        raise ValueError('All gamma candidates must be finite and positive')
+    write_json(out / 'experiment.json', dict(config=config, seeds=args.seeds, top_k=args.top_k,
+               gamma_candidates=gamma_values, selection='highest validation OA; validation loss breaks ties',
+               gamma_selection='mean best validation OA across all seeds; mean loss breaks ties',
+               split_protocol='30/class; insufficient classes use 15; validation=5/class if remainder>5 else 1',
+               train_per_class=args.train_samples, validation_only=args.validation_only,
+               sd_ddof=1, device=str(device), source_sha256=source_hashes(),
+               versions=dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__,
+                             scipy=scipy.__version__, sklearn=sklearn.__version__, skimage=skimage.__version__)))
+    splits = {}
+    for seed in args.seeds:
+        tr, te, va = get_Samples_GT(seed, gt, config['classes'], args.train_samples, 5, 'same_num')
+        assert_disjoint_splits(gt, tr, va, te)
+        splits[seed] = (tr, va, te)
+        run_dir = out / f'seed_{seed}'
+        run_dir.mkdir(exist_ok=True)
+        np.savez_compressed(run_dir / 'splits.npz', train_gt=tr, val_gt=va, test_gt=te,
+                            train_indices=np.flatnonzero(tr), val_indices=np.flatnonzero(va),
+                            test_indices=np.flatnonzero(te))
+        write_json(run_dir / 'split_counts.json', split_counts(tr, va, te, config['classes']))
+    graph_start = time.perf_counter()
+    # No training/validation/test labels are supplied to segmentation or graph construction.
+    segmenter = slic.LDA_SLIC(standardized)
+    Q, S, _, segments = segmenter.simple_superpixel_no_LDA(config['scale'], gamma_values[0])
+    if args.top_k > Q.shape[1]:
+        raise ValueError('top_k exceeds the realized number of superpixels')
+    np.savez_compressed(out / 'graph.npz', segments=segments, node_spectra=S)
+    image_tensor = torch.as_tensor(standardized, device=device)
+    validation_results = []
+    for gamma in gamma_values:
+        adjacency_np = slic.gaussian_affinity_graph(segments, S, gamma)
+        adjacency = torch.as_tensor(adjacency_np, device=device)
+        graph_stats = dict(gamma=gamma, nodes=len(S), undirected_edges=int(np.count_nonzero(adjacency_np) // 2),
+                           diagonal_zero=bool(np.all(np.diag(adjacency_np) == 0)),
+                           symmetric=bool(np.array_equal(adjacency_np, adjacency_np.T)))
+        write_json(out / f'graph_gamma_{gamma}.json', graph_stats)
+        for seed in args.seeds:
+            tr, va, _ = splits[seed]
+            record = train_candidate(image_tensor, adjacency, Q, segments, tr, va,
+                        config, seed, gamma, args.top_k,
+                        out / f'gamma_{gamma}' / f'seed_{seed}', device)
+            validation_results.append(record)
+    chosen_gamma = select_gamma(validation_results)
+    write_json(out / 'selection.json', dict(selected_gamma=chosen_gamma, candidates=validation_results,
+               test_used_for_selection=False, segmentation_and_search_seconds=time.perf_counter() - graph_start))
+    print(f'{dataset}: selected gamma={chosen_gamma:g} using validation only', flush=True)
+    if args.validation_only:
+        return
+    adjacency = torch.as_tensor(slic.gaussian_affinity_graph(segments, S, chosen_gamma), device=device)
+    test_results = []
+    for seed in args.seeds:
+        chosen = next(r for r in validation_results if r['seed'] == seed and r['gamma'] == chosen_gamma)
+        tr, _, te = splits[seed]
+        test_results.append(evaluate_selected(image_tensor, adjacency, Q, segments, tr, te,
+                           config, chosen, args.top_k, out / f'seed_{seed}', device, not args.no_plots))
+    keys = ['OA', 'AA', 'Kappa', 'macro_F1', 'per_class_recall']
+    summary = dict(dataset=dataset, runs=len(test_results), selected_gamma=chosen_gamma,
+                   units='percent', standard_deviation='sample (ddof=1)', results=test_results)
+    for key in keys:
+        values = np.asarray([record[key] for record in test_results])
+        summary[key] = dict(mean=values.mean(axis=0),
+                            sd=values.std(axis=0, ddof=1) if len(values) > 1 else None)
+    write_json(out / 'summary.json', summary)
+    with (out / 'summary.csv').open('w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(['metric', 'mean_percent', 'sample_sd_percent'])
+        for key in keys[:-1]:
+            writer.writerow([key, summary[key]['mean'], summary[key]['sd']])
+        for i in range(config['classes']):
+            sd = summary['per_class_recall']['sd']
+            writer.writerow([f'class_{i + 1}', summary['per_class_recall']['mean'][i], None if sd is None else sd[i]])
+
+
+def parse_args(argv=None):
+    base = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--datasets', nargs='+', choices=list(PAPER_CONFIG), default=['IP'])
+    parser.add_argument('--data-root', type=Path, default=base / 'datasets')
+    parser.add_argument('--output-root', type=Path, default=base / 'results')
+    parser.add_argument('--seeds', type=int, nargs='+', default=DEFAULT_SEEDS)
+    parser.add_argument('--train-samples', type=int, default=30)
+    parser.add_argument('--epochs', type=int)
+    parser.add_argument('--dim', type=int)
+    parser.add_argument('--scale', type=float)
+    parser.add_argument('--top-k', type=int, default=5)
+    gamma_group = parser.add_mutually_exclusive_group()
+    gamma_group.add_argument('--gamma', type=float, default=1.0,
+                             help='Fixed gamma; 1.0 is a starting value, not a recovered experimental setting')
+    gamma_group.add_argument('--gamma-values', type=float, nargs='+',
+                             help='Select one gamma per dataset using validation runs only')
+    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
+    parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--no-plots', action='store_true')
+    parser.add_argument('--validation-only', action='store_true',
+                        help='For tuning hidden dimension/scale/k: never calculate test scores')
+    args = parser.parse_args(argv)
+    if len(set(args.seeds)) != len(args.seeds):
+        parser.error('seeds must be unique')
+    if args.epochs is not None and args.epochs < 1:
+        parser.error('epochs must be positive')
+    if args.dim is not None and args.dim < 2:
+        parser.error('dim must be at least two')
+    if args.top_k < 1 or args.train_samples < 1 or args.threads < 1:
+        parser.error('top-k, train-samples and threads must be positive')
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    torch.set_num_threads(args.threads)
+    device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA was requested but is unavailable')
+    root = args.output_root / ('paper_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    root.mkdir(parents=True, exist_ok=False)
+    print('Outputs:', root.resolve(), flush=True)
+    for dataset in args.datasets:
+        run_dataset(args, dataset, root, device)
+
+
+if __name__ == '__main__':
+    main()

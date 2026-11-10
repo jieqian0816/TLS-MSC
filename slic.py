@@ -1,141 +1,122 @@
+"""SLIC regions and the fixed Gaussian graph in manuscript Eqs. (7)--(8)."""
 import numpy as np
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
 from skimage.segmentation import slic
-from sklearn import preprocessing
 
 
 def SegmentsLabelProcess(labels):
-    
-    labels = np.array(labels, np.int64)
-    H, W = labels.shape
-    ls = list(set(np.reshape(labels, [-1]).tolist()))
-    
-    dic = {}
-    for i in range(len(ls)):
-        dic[ls[i]] = i
-    
-    new_labels = labels
-    for i in range(H):
-        for j in range(W):
-            new_labels[i, j] = dic[new_labels[i, j]]
-    return new_labels
+    """Reindex arbitrary region IDs to contiguous zero-based IDs."""
+    labels = np.asarray(labels)
+    if labels.ndim != 2:
+        raise ValueError('segments must be a two-dimensional image')
+    return np.unique(labels, return_inverse=True)[1].reshape(labels.shape)
 
 
-class SLIC(object):
-    def __init__(self, HSI, labels, n_segments=1000, compactness=20, max_iter=20, sigma=0, min_size_factor=0.3,
-                 max_size_factor=2):
-        self.HSI = HSI
-        self.n_segments = n_segments
+def spatial_neighbor_pairs(segments):
+    """All undirected shared four-connected boundaries, including image borders."""
+    segments = np.asarray(segments)
+    if segments.ndim != 2:
+        raise ValueError('segments must be a two-dimensional image')
+    horizontal = np.column_stack((segments[:, :-1].ravel(), segments[:, 1:].ravel()))
+    vertical = np.column_stack((segments[:-1, :].ravel(), segments[1:, :].ravel()))
+    pairs = np.concatenate((horizontal, vertical), axis=0)
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    return np.unique(np.sort(pairs, axis=1), axis=0).astype(np.int64)
+
+
+def gaussian_affinity_graph(segments, node_spectra, gamma=1.0):
+    """A_ij = exp(-gamma * mean_b((p_ib - p_jb)**2)); A_ii = 0.
+
+    node_spectra are region means of standardized input spectra. Dividing
+    squared Euclidean distances by B is exactly the manuscript's x_i=p_i/sqrt(B).
+    Region IDs must index rows of node_spectra. This function takes no labels.
+    """
+    segments = np.asarray(segments)
+    spectra = np.asarray(node_spectra, dtype=np.float64)
+    if not np.isfinite(gamma) or gamma <= 0:
+        raise ValueError('gamma must be finite and strictly positive')
+    if spectra.ndim != 2 or spectra.shape[1] == 0 or not np.isfinite(spectra).all():
+        raise ValueError('node_spectra must be a finite M-by-B matrix')
+    if not np.array_equal(np.unique(segments), np.arange(len(spectra))):
+        raise ValueError('segments must use contiguous IDs 0,...,M-1')
+    adjacency = np.zeros((len(spectra), len(spectra)), dtype=np.float32)
+    pairs = spatial_neighbor_pairs(segments)
+    if len(pairs):
+        delta = spectra[pairs[:, 0]] - spectra[pairs[:, 1]]
+        weights = np.exp(-float(gamma) * np.mean(delta * delta, axis=1)).astype(np.float32)
+        if not np.all(weights > 0):
+            raise ValueError('Gaussian weights underflowed; choose a smaller gamma')
+        adjacency[pairs[:, 0], pairs[:, 1]] = weights
+        adjacency[pairs[:, 1], pairs[:, 0]] = weights
+    return adjacency
+
+
+class SLIC:
+    def __init__(self, HSI, labels=None, n_segments=1000, compactness=20,
+                 max_iter=20, sigma=0, min_size_factor=0.3, max_size_factor=2):
+        image = np.asarray(HSI)
+        if image.ndim != 3 or not np.isfinite(image).all():
+            raise ValueError('HSI must be a finite H-by-W-by-B image')
+        h, w, bands = image.shape
+        self.data = StandardScaler().fit_transform(image.reshape(-1, bands)).reshape(h, w, bands)
+        self.n_segments = min(h * w, max(1, int(round(n_segments))))
         self.compactness = compactness
         self.max_iter = max_iter
+        self.sigma = sigma  # Spatial smoothing for SLIC, NOT graph gamma.
         self.min_size_factor = min_size_factor
         self.max_size_factor = max_size_factor
-        self.sigma = sigma
-       
-        height, width, bands = HSI.shape 
-        data = np.reshape(HSI, [height * width, bands])
-        minMax = preprocessing.StandardScaler()
-        data = minMax.fit_transform(data)
-        self.data = np.reshape(data, [height, width, bands])
-        self.labels=labels
-        
-    
+        # labels is accepted for source compatibility but is never read.
+
     def get_Q_and_S_and_Segments(self):
-        img = self.data
-        (h, w, d) = img.shape
-        segments = slic(img, n_segments=self.n_segments, compactness=self.compactness, max_num_iter=self.max_iter, # n_segments越小，分的块数量越少，越大，块越多
-                        convert2lab=False,sigma=self.sigma, enforce_connectivity=True,
-                        min_size_factor=self.min_size_factor, max_size_factor=self.max_size_factor,slic_zero=False)
+        segments = slic(self.data, n_segments=self.n_segments,
+                        compactness=self.compactness, max_num_iter=self.max_iter,
+                        convert2lab=False, sigma=self.sigma,
+                        enforce_connectivity=True, min_size_factor=self.min_size_factor,
+                        max_size_factor=self.max_size_factor, slic_zero=False,
+                        start_label=0, channel_axis=-1)
+        self.segments = SegmentsLabelProcess(segments)
+        ids = self.segments.ravel()
+        self.superpixel_count = int(ids.max()) + 1
+        counts = np.bincount(ids, minlength=self.superpixel_count)
+        sums = np.zeros((self.superpixel_count, self.data.shape[-1]), dtype=np.float64)
+        np.add.at(sums, ids, self.data.reshape(-1, self.data.shape[-1]))
+        self.S = (sums / counts[:, None]).astype(np.float32)
+        self.Q = np.zeros((ids.size, self.superpixel_count), dtype=np.float32)
+        self.Q[np.arange(ids.size), ids] = 1.0
+        return self.Q, self.S, self.segments
 
-       
-        if segments.max()+1!=len(list(set(np.reshape(segments,[-1]).tolist()))): segments = SegmentsLabelProcess(segments)
-        self.segments = segments
-        superpixel_count = segments.max() + 1
-        self.superpixel_count = superpixel_count
-        print("superpixel_count", superpixel_count)
-        segments = np.reshape(segments, [-1])
-        S = np.zeros([superpixel_count, d], dtype=np.float32) 
-        Q = np.zeros([w * h, superpixel_count], dtype=np.float32)
-        x = np.reshape(img, [-1, d])
-        
-        for i in range(superpixel_count):
-            idx = np.where(segments == i)[0]  # 找到属于第 i 个超像素的所有像素的索引
-            count = len(idx)  # 计算该超像素包含的像素数量
-            pixels = x[idx]   # 获取这些像素的光谱向量
-            superpixel = np.sum(pixels, 0) / count  # 计算这些像素的光谱向量均值，作为该超像素的特征向量
-            S[i] = superpixel
-            Q[idx, i] = 1
-        
-        self.S = S
-        self.Q = Q
+    def get_A(self, gamma=1.0):
+        return gaussian_affinity_graph(self.segments, self.S, gamma)
 
-        return Q, S , self.segments
 
-    
-    def get_A(self, sigma: float):
-        
-        A = np.zeros([self.superpixel_count, self.superpixel_count], dtype=np.float32)
-        (h, w) = self.segments.shape
-        for i in range(h - 2):
-            for j in range(w - 2):
-                sub = self.segments[i:i + 2, j:j + 2]
-                sub_max = np.max(sub).astype(np.int32)
-                sub_min = np.min(sub).astype(np.int32)
-                
-                if sub_max != sub_min:
-                    idx1 = sub_max
-                    idx2 = sub_min
-                    if A[idx1, idx2] != 0:
-                        continue
-                    
-                    pix1 = self.S[idx1]
-                    pix2 = self.S[idx2]
-                    
-                    diss1 = np.exp(-0.1*np.dot(pix1-np.mean(pix1),pix2-np.mean(pix2))/(np.linalg.norm(pix1-np.mean(pix1))*np.linalg.norm(pix2-np.mean(pix2)))/ sigma ** 2) #皮尔逊相关系数
+class LDA_SLIC:
+    """Legacy wrapper. The paper path is simple_superpixel_no_LDA only."""
+    def __init__(self, data, labels=None, n_component=None):
+        self.data = np.asarray(data)
+        self.init_labels = labels
+        self.n_component = n_component
+        self.height, self.width, self.bands = self.data.shape
 
-                    A[idx1, idx2] = A[idx2, idx1] = diss1
-        
-        return A
+    def SLIC_Process(self, img, scale=25, gamma=1.0):
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError('segmentation scale must be positive')
+        segmenter = SLIC(img, n_segments=self.height * self.width / scale,
+                         compactness=1, sigma=1, min_size_factor=0.1, max_size_factor=2)
+        Q, S, segments = segmenter.get_Q_and_S_and_Segments()
+        return Q, S, segmenter.get_A(gamma), segments
 
-class LDA_SLIC(object):
-    def __init__(self,data,labels,n_component):
-        self.data=data
-        self.init_labels=labels
-        self.curr_data=data
-        self.n_component=n_component
-        self.height,self.width,self.bands=data.shape
-        self.x_flatt=np.reshape(data,[self.width*self.height,self.bands])
-        self.y_flatt=np.reshape(labels,[self.height*self.width])
-        self.labes=labels
-        
-    def LDA_Process(self,curr_labels):
-        
-        # 取出训练样本（IP数据集有450个）
-        curr_labels=np.reshape(curr_labels,[-1])
-        idx=np.where(curr_labels!=0)[0]
-        x=self.x_flatt[idx]  # x.shape：(450, 200)
-        y=curr_labels[idx]  # y.shape: (450,)
-        lda = LinearDiscriminantAnalysis()
-        # 使用x和y-1训练LDA模型。y-1是将标签值减1，通常用于将标签从1,2,...转换为0,1,...因为Scikit-learn的LDA要求标签从0开始。
-        lda.fit(x,y-1)
+    def simple_superpixel_no_LDA(self, scale, gamma=1.0):
+        return self.SLIC_Process(self.data, scale=scale, gamma=gamma)
 
-        X_new = lda.transform(self.x_flatt)  # X_new.shape: (21025, 15)
-        return np.reshape(X_new,[self.height, self.width, -1])
-       
-    def SLIC_Process(self,img,scale=25):
-        n_segments_init=self.height*self.width/scale
-        print("n_segments_init",n_segments_init)
-        myslic=SLIC(img,n_segments=n_segments_init,labels=self.labes, compactness=1,sigma=1, min_size_factor=0.1, max_size_factor=2)
-        Q, S, Segments = myslic.get_Q_and_S_and_Segments()
-        A=myslic.get_A(sigma=10)
-        return Q,S,A,Segments
-        
-    def simple_superpixel(self,scale):
-        curr_labels = self.init_labels
-        X = self.LDA_Process(curr_labels)
-        Q, S, A, Seg = self.SLIC_Process(X,scale=scale)
-        return Q, S, A,Seg
-    
-    def simple_superpixel_no_LDA(self,scale):
-        Q, S, A, Seg = self.SLIC_Process(self.data,scale=scale)
-        return Q, S, A,Seg
+    def LDA_Process(self, curr_labels):
+        """Optional legacy transform; not used by the manuscript experiments."""
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        labels = np.asarray(curr_labels).ravel()
+        valid = labels > 0
+        data = self.data.reshape(-1, self.bands)
+        transformed = LinearDiscriminantAnalysis(n_components=self.n_component).fit(
+            data[valid], labels[valid]).transform(data)
+        return transformed.reshape(self.height, self.width, -1)
+
+    def simple_superpixel(self, scale, gamma=1.0):
+        return self.SLIC_Process(self.LDA_Process(self.init_labels), scale, gamma)
